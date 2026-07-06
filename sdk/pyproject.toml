@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollamabot-client"
+version = "0.1.0"
+description = "Client SDK + CLI for the ollamabot API server (local ollama models behind bearer-token auth)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Jason Bian" }]
+
+[project.scripts]
+ollamabot = "ollamabot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ollamabot*"]

@@ -1,0 +1,10 @@
+# secrets & local state — never commit
+bot.py
+tokens.json
+*.log
+
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
