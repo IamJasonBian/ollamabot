@@ -5,12 +5,16 @@ set -e
 
 REPO="git+https://github.com/IamJasonBian/ollamabot.git#subdirectory=sdk"
 
-if command -v pipx >/dev/null 2>&1; then
+# --user is invalid inside a virtualenv
+USERFLAG="--user"
+[ -n "$VIRTUAL_ENV" ] && USERFLAG=""
+
+if [ -z "$VIRTUAL_ENV" ] && command -v pipx >/dev/null 2>&1; then
     pipx install "$REPO"
 elif command -v pip3 >/dev/null 2>&1; then
-    pip3 install --user "$REPO"
+    pip3 install $USERFLAG "$REPO"
 elif command -v pip >/dev/null 2>&1; then
-    pip install --user "$REPO"
+    pip install $USERFLAG "$REPO"
 else
     echo "error: need pipx or pip installed" >&2
     exit 1
