@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ollamabot-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Client SDK + CLI for the ollamabot API server (local ollama models behind bearer-token auth)"
 readme = "README.md"
 requires-python = ">=3.8"

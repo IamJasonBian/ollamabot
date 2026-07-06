@@ -25,6 +25,9 @@ def main():
     sub.add_parser("models")
     chat = sub.add_parser("chat")
     chat.add_argument("-m", "--model", help="model alias or ollama tag (default: server default)")
+    chat.add_argument("--sync", action="store_true",
+                      help="single blocking request instead of job+polling (short prompts only)")
+    chat.add_argument("--thinking", action="store_true", help="also print the model's <think> block")
     chat.add_argument("prompt", nargs="*", help="prompt text (reads stdin if omitted)")
 
     args = p.parse_args()
@@ -43,7 +46,13 @@ def main():
             prompt = " ".join(args.prompt) if args.prompt else sys.stdin.read().strip()
             if not prompt:
                 sys.exit("no prompt given")
-            print(client.chat(prompt, model=args.model))
+            if args.sync:
+                print(client.chat(prompt, model=args.model))
+            else:
+                result = client.ask(prompt, model=args.model)
+                if args.thinking and result.get("thinking"):
+                    print(f"--- thinking ---\n{result['thinking']}\n--- reply ---", file=sys.stderr)
+                print(result["content"])
     except APIError as e:
         sys.exit(f"error: {e}")
     except OSError as e:

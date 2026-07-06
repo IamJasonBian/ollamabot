@@ -12,15 +12,25 @@ Usage:
 API (all /v1/* require "Authorization: Bearer <token>"):
   GET  /healthz                 no auth, liveness check
   GET  /v1/models               model aliases + underlying ollama tags
-  POST /v1/chat                 {"model": "hermes", "messages": [...]}
-                                or shorthand {"model": "hermes", "prompt": "hi"}
+  POST /v1/chat                 synchronous; {"model": "hermes", "messages": [...]}
+                                or shorthand {"model": "hermes", "prompt": "hi"}.
+                                Short prompts only — proxies (Cloudflare) kill
+                                requests at ~100s.
+  POST /v1/jobs                 same body; returns {"job_id", "status"} at once
+  GET  /v1/jobs/<id>            poll until "status" is "done" (or "error")
+
+Responses separate model reasoning from the answer: "content" is the clean
+reply, "thinking" holds any <think>...</think> block (qwen3 emits these).
 """
 import argparse
 import json
 import logging
 import pathlib
+import re
 import secrets
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,18 +63,55 @@ def save_tokens(tokens):
 
 
 def ollama_chat(model, messages):
+    """Returns (content, thinking). Ollama reports reasoning either as a separate
+    message.thinking field (current versions) or inline <think> tags (older)."""
     req = urllib.request.Request(
         f"{OLLAMA}/api/chat",
         data=json.dumps({"model": model, "messages": messages, "stream": False}).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.load(r)["message"]["content"].strip()
+        msg = json.load(r)["message"]
+    content, inline_thinking = split_thinking(msg["content"].strip())
+    return content, msg.get("thinking", "").strip() or inline_thinking
 
 
 def ollama_tags():
     with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=10) as r:
         return [m["name"] for m in json.load(r)["models"]]
+
+
+THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def split_thinking(text):
+    """Return (content, thinking) with <think> blocks pulled out of the reply."""
+    thinking = "\n".join(m.strip() for m in THINK_RE.findall(text)) or None
+    return THINK_RE.sub("", text).strip(), thinking
+
+
+JOB_TTL = 3600  # seconds a finished job stays fetchable
+jobs = {}       # job_id -> dict
+jobs_lock = threading.Lock()
+
+
+def prune_jobs():
+    cutoff = time.time() - JOB_TTL
+    with jobs_lock:
+        for jid in [j for j, v in jobs.items() if v["created"] < cutoff]:
+            del jobs[jid]
+
+
+def run_job(job_id, model, messages):
+    with jobs_lock:
+        jobs[job_id]["status"] = "running"
+    try:
+        content, thinking = ollama_chat(model, messages)
+        update = {"status": "done", "content": content, "thinking": thinking}
+    except Exception as e:
+        update = {"status": "error", "error": str(e)}
+    with jobs_lock:
+        jobs[job_id].update(update, elapsed=round(time.time() - jobs[job_id]["created"], 1))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,44 +153,72 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(502, {"error": f"ollama unreachable: {e}"})
                 return
             self.reply(200, {"aliases": MODELS, "default": DEFAULT_MODEL, "ollama_tags": tags})
+        elif self.path.startswith("/v1/jobs/"):
+            job_id = self.path[len("/v1/jobs/"):]
+            with jobs_lock:
+                job = jobs.get(job_id)
+                snapshot = dict(job) if job else None
+            if not snapshot:
+                self.reply(404, {"error": "no such job (expired or never existed)"})
+                return
+            self.reply(200, snapshot)
         else:
             self.reply(404, {"error": "not found"})
+
+    def parse_chat_body(self):
+        """Returns (model, messages) or None after sending an error reply."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self.reply(400, {"error": "invalid JSON body"})
+            return None
+        model_key = payload.get("model", DEFAULT_MODEL)
+        model = MODELS.get(model_key, model_key)  # allow alias or raw ollama tag
+        messages = payload.get("messages")
+        if not messages and payload.get("prompt"):
+            messages = [{"role": "user", "content": payload["prompt"]}]
+        if not isinstance(messages, list) or not messages:
+            self.reply(400, {"error": "provide 'messages' (list) or 'prompt' (string)"})
+            return None
+        return model, messages
 
     def do_POST(self):
         client = self.auth()
         if not client:
             self.reply(401, {"error": "missing or invalid bearer token"})
             return
-        if self.path != "/v1/chat":
+
+        if self.path == "/v1/chat":
+            parsed = self.parse_chat_body()
+            if not parsed:
+                return
+            model, messages = parsed
+            log.info("chat client=%s model=%s messages=%d", client, model, len(messages))
+            try:
+                content, thinking = ollama_chat(model, messages)
+            except urllib.error.HTTPError as e:
+                self.reply(502, {"error": f"ollama error: {e.read().decode(errors='replace')[:500]}"})
+                return
+            except Exception as e:
+                self.reply(502, {"error": f"ollama unreachable: {e}"})
+                return
+            self.reply(200, {"model": model, "content": content, "thinking": thinking})
+        elif self.path == "/v1/jobs":
+            parsed = self.parse_chat_body()
+            if not parsed:
+                return
+            model, messages = parsed
+            prune_jobs()
+            job_id = secrets.token_urlsafe(16)
+            with jobs_lock:
+                jobs[job_id] = {"job_id": job_id, "status": "queued", "model": model,
+                                "created": time.time()}
+            threading.Thread(target=run_job, args=(job_id, model, messages), daemon=True).start()
+            log.info("job=%s client=%s model=%s messages=%d", job_id, client, model, len(messages))
+            self.reply(202, {"job_id": job_id, "status": "queued"})
+        else:
             self.reply(404, {"error": "not found"})
-            return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length))
-        except (ValueError, json.JSONDecodeError):
-            self.reply(400, {"error": "invalid JSON body"})
-            return
-
-        model_key = payload.get("model", DEFAULT_MODEL)
-        model = MODELS.get(model_key, model_key)  # allow alias or raw ollama tag
-
-        messages = payload.get("messages")
-        if not messages and payload.get("prompt"):
-            messages = [{"role": "user", "content": payload["prompt"]}]
-        if not isinstance(messages, list) or not messages:
-            self.reply(400, {"error": "provide 'messages' (list) or 'prompt' (string)"})
-            return
-
-        log.info("chat client=%s model=%s messages=%d", client, model, len(messages))
-        try:
-            content = ollama_chat(model, messages)
-        except urllib.error.HTTPError as e:
-            self.reply(502, {"error": f"ollama error: {e.read().decode(errors='replace')[:500]}"})
-            return
-        except Exception as e:
-            self.reply(502, {"error": f"ollama unreachable: {e}"})
-            return
-        self.reply(200, {"model": model, "content": content})
 
 
 def cmd_token(args):
