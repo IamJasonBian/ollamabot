@@ -121,16 +121,27 @@ curl -s -X POST "http://localhost:8080/submissions?base64_encoded=false&wait=tru
 # -> {"stdout": "42\n", "status": {"id": 3, "description": "Accepted"}, "time": "0.06", ...}
 ```
 
-- Python only (`language_id` 71), always synchronous. It runs the machine's
-  system Python (3.9 on current macOS), where hosted Judge0 CE runs 3.8; set
-  `JUDGE_PYTHON` to choose another interpreter.
-- Each program runs under `sandbox-exec` in its own temporary directory: no
-  network, no fork or subprocesses, no reads outside the system and the
-  interpreter (the home directory is not readable), no writes outside its
-  directory. CPU, wall time, memory (polled, 512 MB cap) and output (1 MB) are
-  limited and at most two programs run at once.
-- This is a macOS sandbox, not Judge0's `isolate`. `python3 test_judge.py`
-  checks the containment on the machine it runs on; run it after an OS update.
+- Python only (`language_id` 71), always synchronous, at most two programs at
+  once. CPU, wall time, memory (512 MB cap) and output (1 MB) are limited. Set
+  `JUDGE_PYTHON` to choose the interpreter.
+- On macOS each program runs under `sandbox-exec` in its own temporary
+  directory with the system Python (3.9): no network, no fork or subprocesses,
+  no reads outside the system and the interpreter, no writes outside its
+  directory. This is a macOS sandbox, not Judge0's `isolate`.
+- On Linux each program runs as a transient systemd unit (`systemd-run`) with a
+  throwaway user, no network, a read-only system, a private `/tmp`, and cgroup
+  limits. The server must run as root, so give it a small VM of its own, e.g.
+  with Lima on a Mac:
+
+  ```bash
+  limactl start --name=judge --cpus=4 --memory=4 --disk=20 --vm-type=vz \
+    --mount-none --containerd=none template://ubuntu-lts
+  # in the VM: install python3.8 (deadsnakes PPA), copy server.py + judge.py to
+  # /opt/judge, run "python3 server.py serve --port 2358" as a systemd service.
+  # Lima forwards the port to 127.0.0.1:2358 on the Mac.
+  ```
+- `python3 test_judge.py` (as root on Linux) checks the containment on the
+  machine it runs on; run it after an OS update.
 - Chat tokens are refused (403), since they can end up in browser frontends.
   The token may be sent as `Authorization: Bearer` or `X-Auth-Token`.
 

@@ -1,19 +1,25 @@
 """Judge0-compatible Python runner for the API server.
 
-Runs one submitted program in a macOS sandbox (sandbox-exec) with no network,
-no access to the home directory, a CPU limit, a wall-clock limit and capped
-output, and reports the result in Judge0's response shape so a Judge0 client
-can point at this server unchanged.
+Runs one submitted program with no network, no access to the server's files,
+CPU, wall-clock, memory and output limits, and reports the result in Judge0's
+response shape so a Judge0 client can point at this server unchanged.
+
+Two sandboxes, chosen by platform:
+  macOS  sandbox-exec profile plus a memory watchdog (run as the server user).
+  Linux  a transient systemd unit per run (systemd-run); the server must be
+         root. Meant for a small VM dedicated to judging.
 """
 import ctypes
 import ctypes.util
 import os
 import pathlib
+import re
 import resource
 import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,9 +30,14 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_CPU_SECONDS = 10
 MAX_WALL_SECONDS = 15
 MAX_MEMORY_KB = 512 * 1024
-POLL_SECONDS = 0.05
 MAX_CONCURRENT = 2
 QUEUE_WAIT_SECONDS = 20
+POLL_SECONDS = 0.05
+
+LINUX = sys.platform.startswith("linux")
+SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+# Linux run directories live here; each run sees only its own main.py.
+LINUX_RUN_ROOT = "/run/judge"
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # Deny everything, then allow only what a pure-Python program needs: read the
@@ -74,7 +85,7 @@ STATUS = {
 
 slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 _interpreter = None
-_libproc = ctypes.CDLL(ctypes.util.find_library("proc"), use_errno=True)
+_libproc = None if LINUX else ctypes.CDLL(ctypes.util.find_library("proc"), use_errno=True)
 
 
 class JudgeError(Exception):
@@ -86,17 +97,19 @@ class JudgeError(Exception):
 
 
 def interpreter():
-    """Resolve the real Python binary once.
+    """Resolve the Python binary that runs submissions, once.
 
-    /usr/bin/python3 is a shim that locates the interpreter through xcrun,
-    which the sandbox does not allow; the resolved binary runs directly.
+    On macOS /usr/bin/python3 is a shim that locates the interpreter through
+    xcrun, which the sandbox does not allow; the resolved binary runs directly.
+    JUDGE_PYTHON overrides the default (python3.8 on Linux when present).
 
     Returns:
-        Absolute path of the interpreter to run submissions with.
+        Absolute path of the interpreter.
     """
     global _interpreter
     if _interpreter is None:
-        wanted = os.environ.get("JUDGE_PYTHON", "/usr/bin/python3")
+        default = (shutil.which("python3.8") or "/usr/bin/python3") if LINUX else "/usr/bin/python3"
+        wanted = os.environ.get("JUDGE_PYTHON", default)
         out = subprocess.run(
             [wanted, "-I", "-c", "import sys; print(getattr(sys, '_base_executable', '') or sys.executable)"],
             capture_output=True, text=True, timeout=20, check=True,
@@ -106,7 +119,7 @@ def interpreter():
 
 
 def footprint_kb(pid):
-    """Read a process's physical memory footprint.
+    """Read a macOS process's physical memory footprint.
 
     macOS does not enforce memory rlimits, so the judge polls this instead.
 
@@ -146,10 +159,145 @@ def read_capped(path):
         path: File written by the child.
 
     Returns:
-        The text, or None when the file is empty.
+        The text, or None when the file is missing or empty.
     """
-    data = path.read_bytes()[:MAX_OUTPUT_BYTES]
+    try:
+        data = path.read_bytes()[:MAX_OUTPUT_BYTES]
+    except FileNotFoundError:
+        return None
     return data.decode("utf-8", errors="replace") or None
+
+
+def run_macos(run_dir, cpu, wall, memory_kb):
+    """Run main.py from run_dir under sandbox-exec.
+
+    Args:
+        run_dir: Directory holding main.py and stdin; stdout and stderr land here.
+        cpu: CPU seconds allowed.
+        wall: Wall-clock seconds allowed.
+        memory_kb: Memory footprint allowed, in KB.
+
+    Returns:
+        Tuple of (outcome, exit_code, peak_kb) where outcome is one of
+        "ok", "exit", "timeout", "memory", "segv", "fsize", "signal".
+    """
+    python = interpreter()
+    command = [
+        SANDBOX_EXEC,
+        "-D", "RUN_DIR=%s" % run_dir,
+        "-D", "INTERPRETER_HOME=%s" % os.path.dirname(os.path.dirname(python)),
+        "-p", PROFILE,
+        python, "-I", "-B", "main.py",
+    ]
+    started = time.monotonic()
+    timed_out = over_memory = False
+    peak_kb = 0
+    with open(run_dir / "stdin") as fin, open(run_dir / "stdout", "wb") as fout, open(run_dir / "stderr", "wb") as ferr:
+        child = subprocess.Popen(
+            command, cwd=str(run_dir), stdin=fin, stdout=fout, stderr=ferr,
+            env={"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "PYTHONIOENCODING": "utf-8", "TMPDIR": str(run_dir)},
+            start_new_session=True, preexec_fn=limits(cpu),
+        )
+        try:
+            while child.poll() is None:
+                peak_kb = max(peak_kb, footprint_kb(child.pid))
+                if peak_kb > memory_kb:
+                    over_memory = True
+                    break
+                if time.monotonic() - started > wall:
+                    timed_out = True
+                    break
+                time.sleep(POLL_SECONDS)
+        finally:
+            # Kill the whole session so nothing the program started survives.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+    code = child.returncode
+    if over_memory:
+        return "memory", None, peak_kb
+    if timed_out or code == -signal.SIGXCPU:
+        return "timeout", None, peak_kb
+    if code == 0:
+        return "ok", 0, peak_kb
+    if code == -signal.SIGSEGV:
+        return "segv", None, peak_kb
+    if code == -signal.SIGXFSZ:
+        return "fsize", None, peak_kb
+    if code < 0:
+        return "signal", None, peak_kb
+    return "exit", code, peak_kb
+
+
+def run_linux(run_dir, cpu, wall, memory_kb):
+    """Run main.py from run_dir as a sandboxed transient systemd unit.
+
+    The unit gets a throwaway user, no network, a read-only system, a private
+    /tmp as its working directory, and cgroup limits on memory and tasks. Other
+    runs' directories and the server's own directory are hidden from it.
+
+    Args:
+        run_dir: Directory holding main.py and stdin; stdout and stderr land here.
+        cpu: CPU seconds allowed.
+        wall: Wall-clock seconds allowed.
+        memory_kb: Memory allowed, in KB.
+
+    Returns:
+        Tuple of (outcome, exit_code, peak_kb), as for run_macos.
+    """
+    unit = "judge-%s" % secrets.token_hex(8)
+    properties = [
+        "DynamicUser=yes", "PrivateNetwork=yes", "ProtectSystem=strict", "ProtectHome=yes",
+        "PrivateTmp=yes", "PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes", "ProtectControlGroups=yes", "RestrictSUIDSGID=yes",
+        "RestrictNamespaces=yes", "LockPersonality=yes", "CapabilityBoundingSet=",
+        "TemporaryFileSystem=%s:ro" % LINUX_RUN_ROOT,
+        "BindReadOnlyPaths=%s:%s/main.py" % (run_dir / "main.py", LINUX_RUN_ROOT),
+        "InaccessiblePaths=%s" % SERVER_DIR,
+        "WorkingDirectory=/tmp",
+        "MemoryMax=%dK" % memory_kb, "MemorySwapMax=0", "TasksMax=32", "CPUQuota=100%",
+        "RuntimeMaxSec=%s" % wall, "LimitCPU=%d:%d" % (cpu, cpu + 1), "LimitFSIZE=%d" % MAX_OUTPUT_BYTES,
+        "LimitNOFILE=64", "LimitCORE=0",
+        "StandardInput=file:%s" % (run_dir / "stdin"),
+        "StandardOutput=file:%s" % (run_dir / "stdout"),
+        "StandardError=file:%s" % (run_dir / "stderr"),
+        "Environment=PYTHONIOENCODING=utf-8 LANG=C.UTF-8",
+    ]
+    command = ["systemd-run", "--wait", "--collect", "--unit", unit]
+    for prop in properties:
+        command += ["-p", prop]
+    command += [interpreter(), "-I", "-B", "%s/main.py" % LINUX_RUN_ROOT]
+    try:
+        report = subprocess.run(command, capture_output=True, text=True, timeout=wall + 10).stderr
+    except subprocess.TimeoutExpired:
+        subprocess.run(["systemctl", "kill", "--signal=KILL", unit], capture_output=True)
+        return "timeout", None, 0
+    result = re.search(r"Finished with result: (\S+)", report)
+    # e.g. "code=exited, status=3/NOTIMPLEMENTED" or "code=killed, status=11/SEGV"
+    ended = re.search(r"terminated with: code=(\w+), status=(\d+)/(\w+)", report)
+    peak = re.search(r"Memory peak: ([\d.]+)([BKMG])", report)
+    peak_kb = int(float(peak.group(1)) * {"B": 1 / 1024, "K": 1, "M": 1024, "G": 1024 * 1024}[peak.group(2)]) if peak else 0
+    if not result or not ended:
+        raise RuntimeError("systemd-run gave no result: %s" % report.strip()[-300:])
+    how, number, name = ended.group(1), int(ended.group(2)), ended.group(3)
+    if result.group(1) == "success":
+        return "ok", 0, peak_kb
+    if result.group(1) == "oom-kill":
+        return "memory", None, peak_kb
+    if result.group(1) == "timeout" or name == "XCPU":
+        return "timeout", None, peak_kb
+    if how == "exited":
+        return "exit", number, peak_kb
+    if name == "SEGV":
+        return "segv", None, peak_kb
+    if name == "XFSZ":
+        return "fsize", None, peak_kb
+    return "signal", None, peak_kb
+
+
+OUTCOME_STATUS = {"ok": 3, "exit": 11, "timeout": 5, "memory": 12, "segv": 7, "fsize": 8, "signal": 12}
 
 
 def run_submission(payload):
@@ -185,61 +333,19 @@ def run_submission(payload):
 
     if not slots.acquire(timeout=QUEUE_WAIT_SECONDS):
         raise JudgeError(503, "judge is busy, try again")
-    run_dir = pathlib.Path(os.path.realpath(tempfile.mkdtemp(prefix="judge-")))
+    if LINUX:
+        os.makedirs(LINUX_RUN_ROOT, mode=0o755, exist_ok=True)
+    run_dir = pathlib.Path(os.path.realpath(tempfile.mkdtemp(prefix="run-", dir=LINUX_RUN_ROOT if LINUX else None)))
     try:
         (run_dir / "main.py").write_text(source)
         (run_dir / "stdin").write_text(stdin)
-        python = interpreter()
-        command = [
-            SANDBOX_EXEC,
-            "-D", "RUN_DIR=%s" % run_dir,
-            "-D", "INTERPRETER_HOME=%s" % os.path.dirname(os.path.dirname(python)),
-            "-p", PROFILE,
-            python, "-I", "-B", "main.py",
-        ]
+        if LINUX:
+            os.chmod(run_dir / "main.py", 0o644)
         started = time.monotonic()
-        timed_out = over_memory = False
-        peak_kb = 0
-        with open(run_dir / "stdin") as fin, open(run_dir / "stdout", "wb") as fout, open(run_dir / "stderr", "wb") as ferr:
-            child = subprocess.Popen(
-                command, cwd=str(run_dir), stdin=fin, stdout=fout, stderr=ferr,
-                env={"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "PYTHONIOENCODING": "utf-8", "TMPDIR": str(run_dir)},
-                start_new_session=True, preexec_fn=limits(cpu),
-            )
-            try:
-                while child.poll() is None:
-                    peak_kb = max(peak_kb, footprint_kb(child.pid))
-                    if peak_kb > memory_kb:
-                        over_memory = True
-                        break
-                    if time.monotonic() - started > wall:
-                        timed_out = True
-                        break
-                    time.sleep(POLL_SECONDS)
-            finally:
-                # Kill the whole session so nothing the program started survives.
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
+        outcome, exit_code, peak_kb = (run_linux if LINUX else run_macos)(run_dir, cpu, wall, memory_kb)
         elapsed = time.monotonic() - started
-        code = child.returncode
-        message = None
-        if over_memory:
-            status, exit_code, message = 12, None, "Memory limit exceeded (%d KB)" % memory_kb
-        elif timed_out or code == -signal.SIGXCPU:
-            status, exit_code = 5, None
-        elif code == 0:
-            status, exit_code = 3, 0
-        elif code == -signal.SIGSEGV:
-            status, exit_code = 7, None
-        elif code == -signal.SIGXFSZ:
-            status, exit_code = 8, None
-        elif code < 0:
-            status, exit_code = 12, None
-        else:
-            status, exit_code = 11, code
+        status = OUTCOME_STATUS[outcome]
+        message = "Memory limit exceeded (%d KB)" % memory_kb if outcome == "memory" else None
         return {
             "stdout": read_capped(run_dir / "stdout"),
             "stderr": read_capped(run_dir / "stderr"),

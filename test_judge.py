@@ -8,7 +8,21 @@ import sys
 
 import judge
 
+# Files a submission must never be able to read: the server's own directory
+# (tokens live there) and something in the home directory of whoever runs it.
+SERVER_FILE = os.path.join(os.path.dirname(os.path.abspath(judge.__file__)), "judge.py")
 HOME = os.path.expanduser("~")
+HOME_FILE = next((os.path.join(HOME, n) for n in (".ssh/config", ".profile", ".bashrc", ".zshrc")
+                  if os.path.exists(os.path.join(HOME, n))), None)
+ESCAPE_FILE = os.path.join(HOME, "judge-escape-test")
+DENIED = ("PermissionError", "Operation not permitted", "FileNotFoundError", "Permission denied")
+
+
+def denied(result):
+    """True when a read attempt produced no output and a denial error."""
+    return not result["stdout"] and any(word in (result["stderr"] or "") for word in DENIED)
+
+
 CASES = [
     # name, source, stdin, expected status id, check(result) -> bool
     ("hello", "print('hi')", "", 3, lambda r: r["stdout"] == "hi\n"),
@@ -23,24 +37,27 @@ CASES = [
     ("syntax_error", "def (:", "", 11, lambda r: "SyntaxError" in r["stderr"]),
     ("infinite_loop", "while True: pass", "", 5, lambda r: True),
     ("sleep_forever", "import time; time.sleep(60)", "", 5, lambda r: True),
-    ("read_home", "import os\nprint(os.listdir(%r))" % HOME, "", 11, lambda r: "PermissionError" in r["stderr"] or "Operation not permitted" in r["stderr"]),
-    ("read_ssh_key", "print(open(%r).read())" % os.path.join(HOME, ".ssh", "config"), "", 11,
-     lambda r: "Operation not permitted" in r["stderr"] and not r["stdout"]),
-    ("read_tokens", "print(open(%r).read())" % os.path.join(os.path.dirname(os.path.abspath(judge.__file__)), "judge.py"), "", 11,
-     lambda r: "Operation not permitted" in r["stderr"]),
-    ("write_outside", "open('/tmp/judge-escape-test', 'w').write('x')", "", 11, lambda r: not os.path.exists("/tmp/judge-escape-test")),
+    ("read_home_dir", "import os\nprint(os.listdir(%r))" % HOME, "", 11, denied),
+    ("read_home_file", "print(open(%r).read())" % (HOME_FILE or os.path.join(HOME, ".profile")), "", 11, denied),
+    ("read_server_file", "print(open(%r).read())" % SERVER_FILE, "", 11, denied),
+    ("read_other_runs", "import os\nprint([n for n in os.listdir(%r) if n.startswith(('run-', 'judge-'))])"
+     % (judge.LINUX_RUN_ROOT if judge.LINUX else os.path.realpath("/tmp")), "", None,
+     lambda r: (r["stdout"] or "[]").strip() == "[]"),
+    ("write_outside", "open(%r, 'w').write('x')" % ESCAPE_FILE, "", 11, lambda r: not os.path.exists(ESCAPE_FILE)),
+    ("write_system", "open('/etc/judge-escape-test', 'w').write('x')", "", 11, lambda r: not os.path.exists("/etc/judge-escape-test")),
     ("write_inside", "open('scratch.txt', 'w').write('ok'); print(open('scratch.txt').read())", "", 3, lambda r: r["stdout"] == "ok\n"),
     ("network", "import socket\ns = socket.create_connection(('1.1.1.1', 80), timeout=3)\nprint('connected')", "", 11,
      lambda r: "connected" not in (r["stdout"] or "")),
     ("localhost_network", "import urllib.request\nprint(urllib.request.urlopen('http://127.0.0.1:11434/api/tags', timeout=3).read()[:20])", "", 11,
      lambda r: not r["stdout"]),
-    ("subprocess_shell", "import subprocess\nprint(subprocess.run(['/bin/cat', %r], capture_output=True, text=True))" % os.path.join(HOME, ".ssh", "config"), "", None,
-     lambda r: "Host " not in (r["stdout"] or "")),
+    ("subprocess_read", "import subprocess\nprint(subprocess.run(['/bin/cat', %r], capture_output=True, text=True).stdout[:200])" % SERVER_FILE, "", None,
+     lambda r: "sandbox" not in (r["stdout"] or "")),
     ("output_flood", "import sys\nwhile True: sys.stdout.write('x' * 65536)", "", None,
      lambda r: r["status"]["id"] in (5, 8, 11, 12) and len(r["stdout"] or "") <= judge.MAX_OUTPUT_BYTES),
     ("memory_hog", "x = bytearray(900 * 1024 * 1024)\nfor i in range(0, len(x), 4096): x[i] = 1\nprint('allocated')", "", 12,
      lambda r: "Memory limit" in r["message"] and "allocated" not in (r["stdout"] or "")),
-    ("fork_bomb", "import os\nwhile True: os.fork()", "", 11, lambda r: "Operation not permitted" in r["stderr"] or "PermissionError" in r["stderr"]),
+    ("fork_bomb", "import os\nwhile True: os.fork()", "", None,
+     lambda r: r["status"]["id"] in (5, 11, 12) and any(w in (r["stderr"] or "") for w in ("Operation not permitted", "PermissionError", "BlockingIOError", "Resource temporarily unavailable"))),
     ("memory_reported", "x = bytearray(60 * 1024 * 1024)\nfor i in range(0, len(x), 4096): x[i] = 1\nimport time; time.sleep(0.3)", "", 3,
      lambda r: (r["memory"] or 0) > 50 * 1024),
     ("kill_parent", "import os, signal\nos.kill(os.getppid(), signal.SIGKILL)\nprint('survived')", "", None, lambda r: True),
@@ -66,7 +83,7 @@ def main():
             failed += 1
         except judge.JudgeError as e:
             print("ok   rejected %d: %s" % (e.code, e))
-    print("interpreter:", judge.interpreter())
+    print("platform: %s, interpreter: %s" % (sys.platform, judge.interpreter()))
     sys.exit(1 if failed else 0)
 
 
