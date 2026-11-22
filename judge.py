@@ -13,7 +13,6 @@ import ctypes
 import ctypes.util
 import os
 import pathlib
-import re
 import resource
 import secrets
 import shutil
@@ -30,7 +29,7 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 MAX_CPU_SECONDS = 10
 MAX_WALL_SECONDS = 15
 MAX_MEMORY_KB = 512 * 1024
-MAX_CONCURRENT = 2
+MAX_CONCURRENT = int(os.environ.get("JUDGE_MAX_CONCURRENT", "2"))
 QUEUE_WAIT_SECONDS = 20
 POLL_SECONDS = 0.05
 
@@ -231,12 +230,30 @@ def run_macos(run_dir, cpu, wall, memory_kb):
     return "exit", code, peak_kb
 
 
+def unit_state(unit):
+    """Read a unit's machine-readable state.
+
+    Args:
+        unit: systemd unit name.
+
+    Returns:
+        Dict of the properties the judge needs, as strings.
+    """
+    out = subprocess.run(
+        ["systemctl", "show", unit, "--property=SubState,Result,ExecMainCode,ExecMainStatus,MemoryPeak"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+
+
 def run_linux(run_dir, cpu, wall, memory_kb):
     """Run main.py from run_dir as a sandboxed transient systemd unit.
 
     The unit gets a throwaway user, no network, a read-only system, a private
-    /tmp as its working directory, and cgroup limits on memory and tasks. Other
-    runs' directories and the server's own directory are hidden from it.
+    memory-backed /tmp as its working directory, and cgroup limits on memory
+    and tasks. Other runs' directories and the server's own directory are
+    hidden from it. The outcome comes from the unit's properties, not from
+    systemd's human-readable summary, so it survives systemd updates.
 
     Args:
         run_dir: Directory holding main.py and stdin; stdout and stderr land here.
@@ -247,10 +264,14 @@ def run_linux(run_dir, cpu, wall, memory_kb):
     Returns:
         Tuple of (outcome, exit_code, peak_kb), as for run_macos.
     """
-    unit = "judge-%s" % secrets.token_hex(8)
+    unit = "judge-%s.service" % secrets.token_hex(8)
     properties = [
+        # Keep the finished unit loaded so its result can be read; it is stopped below.
+        "RemainAfterExit=yes",
         "DynamicUser=yes", "PrivateNetwork=yes", "ProtectSystem=strict", "ProtectHome=yes",
-        "PrivateTmp=yes", "PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelTunables=yes",
+        # "disconnected" backs /tmp with memory, so files written there count
+        # against MemoryMax instead of filling the disk.
+        "PrivateTmp=disconnected", "PrivateDevices=yes", "NoNewPrivileges=yes", "ProtectKernelTunables=yes",
         "ProtectKernelModules=yes", "ProtectControlGroups=yes", "RestrictSUIDSGID=yes",
         "RestrictNamespaces=yes", "LockPersonality=yes", "CapabilityBoundingSet=",
         "TemporaryFileSystem=%s:ro" % LINUX_RUN_ROOT,
@@ -258,6 +279,7 @@ def run_linux(run_dir, cpu, wall, memory_kb):
         "InaccessiblePaths=%s" % SERVER_DIR,
         "WorkingDirectory=/tmp",
         "MemoryMax=%dK" % memory_kb, "MemorySwapMax=0", "TasksMax=32", "CPUQuota=100%",
+        # The soft CPU limit raises SIGXCPU (a time limit); the hard one is the backstop.
         "RuntimeMaxSec=%s" % wall, "LimitCPU=%d:%d" % (cpu, cpu + 1), "LimitFSIZE=%d" % MAX_OUTPUT_BYTES,
         "LimitNOFILE=64", "LimitCORE=0",
         "StandardInput=file:%s" % (run_dir / "stdin"),
@@ -265,34 +287,45 @@ def run_linux(run_dir, cpu, wall, memory_kb):
         "StandardError=file:%s" % (run_dir / "stderr"),
         "Environment=PYTHONIOENCODING=utf-8 LANG=C.UTF-8",
     ]
-    command = ["systemd-run", "--wait", "--collect", "--unit", unit]
+    command = ["systemd-run", "--quiet", "--unit", unit]
     for prop in properties:
         command += ["-p", prop]
     command += [interpreter(), "-I", "-B", "%s/main.py" % LINUX_RUN_ROOT]
+    started = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    if started.returncode != 0:
+        raise RuntimeError("systemd-run failed: %s" % started.stderr.strip()[-300:])
+    deadline = time.monotonic() + wall + 5
     try:
-        report = subprocess.run(command, capture_output=True, text=True, timeout=wall + 10).stderr
-    except subprocess.TimeoutExpired:
+        while True:
+            state = unit_state(unit)
+            if state.get("SubState") in ("exited", "failed", "dead"):
+                break
+            if time.monotonic() > deadline:
+                state["Result"] = "timeout"
+                break
+            time.sleep(POLL_SECONDS)
+    finally:
         subprocess.run(["systemctl", "kill", "--signal=KILL", unit], capture_output=True)
-        return "timeout", None, 0
-    result = re.search(r"Finished with result: (\S+)", report)
-    # e.g. "code=exited, status=3/NOTIMPLEMENTED" or "code=killed, status=11/SEGV"
-    ended = re.search(r"terminated with: code=(\w+), status=(\d+)/(\w+)", report)
-    peak = re.search(r"Memory peak: ([\d.]+)([BKMG])", report)
-    peak_kb = int(float(peak.group(1)) * {"B": 1 / 1024, "K": 1, "M": 1024, "G": 1024 * 1024}[peak.group(2)]) if peak else 0
-    if not result or not ended:
-        raise RuntimeError("systemd-run gave no result: %s" % report.strip()[-300:])
-    how, number, name = ended.group(1), int(ended.group(2)), ended.group(3)
-    if result.group(1) == "success":
-        return "ok", 0, peak_kb
-    if result.group(1) == "oom-kill":
+        subprocess.run(["systemctl", "stop", unit], capture_output=True)
+        subprocess.run(["systemctl", "reset-failed", unit], capture_output=True)
+    result = state.get("Result", "")
+    peak = state.get("MemoryPeak", "")
+    peak_kb = int(peak) // 1024 if peak.isdigit() else 0
+    try:
+        code, status = int(state["ExecMainCode"]), int(state["ExecMainStatus"])
+    except (KeyError, ValueError):
+        raise RuntimeError("no result for %s: %r" % (unit, state))
+    if result == "oom-kill":
         return "memory", None, peak_kb
-    if result.group(1) == "timeout" or name == "XCPU":
+    if result == "timeout":
         return "timeout", None, peak_kb
-    if how == "exited":
-        return "exit", number, peak_kb
-    if name == "SEGV":
+    if code == 1:  # CLD_EXITED
+        return ("ok", 0, peak_kb) if status == 0 else ("exit", status, peak_kb)
+    if status == signal.SIGXCPU:
+        return "timeout", None, peak_kb
+    if status == signal.SIGSEGV:
         return "segv", None, peak_kb
-    if name == "XFSZ":
+    if status == signal.SIGXFSZ:
         return "fsize", None, peak_kb
     return "signal", None, peak_kb
 

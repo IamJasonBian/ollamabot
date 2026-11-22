@@ -52,6 +52,9 @@ CASES = [
      lambda r: not r["stdout"]),
     ("subprocess_read", "import subprocess\nprint(subprocess.run(['/bin/cat', %r], capture_output=True, text=True).stdout[:200])" % SERVER_FILE, "", None,
      lambda r: "sandbox" not in (r["stdout"] or "")),
+    ("disk_fill", "import os\nfor i in range(4000):\n    open('fill-%d' % i, 'wb').write(b'x' * 1000000)\nprint('wrote 4 GB')", "", None,
+     lambda r: "wrote 4 GB" not in (r["stdout"] or "")) if judge.LINUX else
+    ("disk_fill_skipped_on_macos", "print('skip')", "", 3, lambda r: True),
     ("output_flood", "import sys\nwhile True: sys.stdout.write('x' * 65536)", "", None,
      lambda r: r["status"]["id"] in (5, 8, 11, 12) and len(r["stdout"] or "") <= judge.MAX_OUTPUT_BYTES),
     ("memory_hog", "x = bytearray(900 * 1024 * 1024)\nfor i in range(0, len(x), 4096): x[i] = 1\nprint('allocated')", "", 12,

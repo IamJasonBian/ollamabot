@@ -129,21 +129,54 @@ curl -s -X POST "http://localhost:8080/submissions?base64_encoded=false&wait=tru
   no reads outside the system and the interpreter, no writes outside its
   directory. This is a macOS sandbox, not Judge0's `isolate`.
 - On Linux each program runs as a transient systemd unit (`systemd-run`) with a
-  throwaway user, no network, a read-only system, a private `/tmp`, and cgroup
-  limits. The server must run as root, so give it a small VM of its own, e.g.
-  with Lima on a Mac:
-
-  ```bash
-  limactl start --name=judge --cpus=4 --memory=4 --disk=20 --vm-type=vz \
-    --mount-none --containerd=none template://ubuntu-lts
-  # in the VM: install python3.8 (deadsnakes PPA), copy server.py + judge.py to
-  # /opt/judge, run "python3 server.py serve --port 2358" as a systemd service.
-  # Lima forwards the port to 127.0.0.1:2358 on the Mac.
-  ```
+  throwaway user, no network, a read-only system, a private memory-backed
+  `/tmp`, and cgroup limits. The server must run as root, so it gets a small VM
+  of its own; `setup.sh` builds that on a Mac.
 - `python3 test_judge.py` (as root on Linux) checks the containment on the
   machine it runs on; run it after an OS update.
 - Chat tokens are refused (403), since they can end up in browser frontends.
   The token may be sent as `Authorization: Bearer` or `X-Auth-Token`.
+
+### Linux judge on a Mac: `setup.sh`
+
+```bash
+./setup.sh               # install or update everything, then run the tests
+./setup.sh start         # start the VM and service (after a reboot)
+./setup.sh test          # containment tests in the VM + a request from the Mac
+./setup.sh token         # print the judge token
+./setup.sh token rotate  # replace the token and print the new one
+./setup.sh status
+```
+
+It installs Lima into `~/.local/lima` (no sudo), creates an Ubuntu VM named
+`judge` with nothing from the Mac mounted, installs Python 3.8, and runs
+`server.py` as `judge.service`. Lima forwards the port to `127.0.0.1:2358` on
+the Mac only. Remove it all with `limactl delete -f judge`.
+
+**Giving the token to a backend.** The token never leaves the VM unless you
+print it. Put it in the backend's server-side environment, never in a frontend
+build variable (a `VITE_*` value is shipped to every browser):
+
+```bash
+JUDGE0_URL=http://127.0.0.1:2358          # or wherever the port is reachable from
+JUDGE0_AUTH_TOKEN=$(./setup.sh token)
+```
+
+A backend on another machine reaches it through a tunnel, for example
+`ssh -N -L 2358:127.0.0.1:2358 <mac>`; a hosted backend needs the port
+published (for example Tailscale Funnel, which adds TLS).
+
+**Ways this breaks, and what to do**
+
+| What happens | Why | Fix |
+|---|---|---|
+| Backend reports "Judge unavailable: fetch failed" after the Mac restarts | the VM does not start by itself | `./setup.sh start` |
+| Same, on a hosted backend | the port is loopback-only on the Mac | publish it or tunnel to it |
+| "auth rejected" | token rotated or mistyped | `./setup.sh token` and update the backend |
+| "judge is busy" under load, then the backend's circuit breaker opens | two programs run at once; a third waits up to 20 s, longer than the backend's 9 s timeout | raise `JUDGE_MAX_CONCURRENT` in `judge.service` (the VM has 4 CPUs) |
+| A solution that works on LeetCode fails here | Python 3.8 lacks newer features (`match`, `functools.cache`, `int.bit_count`) | set `JUDGE_PYTHON` to a newer interpreter |
+| `./setup.sh` fails at Python 3.8 | the deadsnakes archive dropped 3.8 for this Ubuntu release | install another Python and set `JUDGE_PYTHON` |
+| Containment tests fail after an update | a systemd or kernel change | do not expose the judge until `./setup.sh test` passes |
 
 ## Reaching the server remotely
 
