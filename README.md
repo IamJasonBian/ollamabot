@@ -108,6 +108,32 @@ status = c.job(job_id)          # poll until status["status"] == "done"
 print(c.chat("hi", model="hermes"))
 ```
 
+## Judge (Judge0-compatible Python runner)
+
+`POST /submissions` accepts a Judge0 submission and answers in Judge0's response
+shape, so a Judge0 client can use this server as its instance:
+
+```bash
+python3 server.py token new judge-leetcards     # the token name must start with "judge"
+curl -s -X POST "http://localhost:8080/submissions?base64_encoded=false&wait=true" \
+  -H "X-Auth-Token: $TOKEN" \
+  -d '{"language_id": 71, "source_code": "print(6 * 7)"}'
+# -> {"stdout": "42\n", "status": {"id": 3, "description": "Accepted"}, "time": "0.06", ...}
+```
+
+- Python only (`language_id` 71), always synchronous. It runs the machine's
+  system Python (3.9 on current macOS), where hosted Judge0 CE runs 3.8; set
+  `JUDGE_PYTHON` to choose another interpreter.
+- Each program runs under `sandbox-exec` in its own temporary directory: no
+  network, no fork or subprocesses, no reads outside the system and the
+  interpreter (the home directory is not readable), no writes outside its
+  directory. CPU, wall time, memory (polled, 512 MB cap) and output (1 MB) are
+  limited and at most two programs run at once.
+- This is a macOS sandbox, not Judge0's `isolate`. `python3 test_judge.py`
+  checks the containment on the machine it runs on; run it after an OS update.
+- Chat tokens are refused (403), since they can end up in browser frontends.
+  The token may be sent as `Authorization: Bearer` or `X-Auth-Token`.
+
 ## Reaching the server remotely
 
 The server binds `0.0.0.0:8080` with token auth but no TLS. To let people outside

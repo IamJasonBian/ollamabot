@@ -18,6 +18,10 @@ API (all /v1/* require "Authorization: Bearer <token>"):
                                 requests at ~100s.
   POST /v1/jobs                 same body; returns {"job_id", "status"} at once
   GET  /v1/jobs/<id>            poll until "status" is "done" (or "error")
+  POST /submissions             Judge0-compatible Python runner (see judge.py).
+                                Only tokens named "judge..." may call it; the
+                                token may also arrive as "X-Auth-Token", the
+                                header Judge0 clients send.
 
 Responses separate model reasoning from the answer: "content" is the clean
 reply, "thinking" holds any <think>...</think> block (qwen3 emits these).
@@ -34,6 +38,8 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import judge
 
 OLLAMA = "http://localhost:11434"
 
@@ -140,9 +146,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def auth(self):
         header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
+        if header.startswith("Bearer "):
+            token = header[len("Bearer "):].strip()
+        else:
+            token = self.headers.get("X-Auth-Token", "").strip()
+        if not token:
             return None
-        token = header[len("Bearer "):].strip()
         for name, t in load_tokens().items():
             if secrets.compare_digest(t, token):
                 return name
@@ -193,13 +202,45 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return model, messages
 
+    def handle_submission(self, client):
+        """Run one Judge0-style submission for a judge-scoped token."""
+        # Chat tokens can end up in browser frontends; running code needs its own.
+        if not client.startswith("judge"):
+            self.reply(403, {"error": "this token may not run code; mint one named judge-<client>"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 2 * judge.MAX_SOURCE_BYTES + 4096:
+                self.reply(413, {"error": "request body too large"})
+                return
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError):
+            self.reply(400, {"error": "invalid JSON body"})
+            return
+        try:
+            result = judge.run_submission(payload)
+        except judge.JudgeError as e:
+            self.reply(e.code, {"error": str(e)})
+            return
+        except Exception as e:
+            log.exception("judge failed client=%s", client)
+            self.reply(500, {"error": "judge failed: %s" % e})
+            return
+        log.info("judge client=%s status=%s time=%s memory_kb=%s", client,
+                 result["status"]["id"], result["time"], result["memory"])
+        self.reply(201, result)
+
     def do_POST(self):
         client = self.auth()
         if not client:
             self.reply(401, {"error": "missing or invalid bearer token"})
             return
 
-        if self.path == "/v1/chat":
+        if self.path.split("?", 1)[0] == "/submissions":
+            self.handle_submission(client)
+        elif self.path == "/v1/chat":
             parsed = self.parse_chat_body()
             if not parsed:
                 return
